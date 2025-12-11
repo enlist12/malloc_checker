@@ -38,6 +38,7 @@ def get_logger(name: str, level=logging.INFO):
 
 DEFAULT_LIB = "./qnx800/target/qnx/x86_64/usr/lib/libiperf.so"
 ALLOC_FUNCS = ["malloc", "calloc", "realloc"]
+
 logger = get_logger("malloc_checker")
 
 def analyze_library(lib_path: str):
@@ -86,10 +87,10 @@ def analyze_library(lib_path: str):
                 alloc_addrs.add(addr)
 
     if not alloc_addrs:
-        print("[!] No allocator symbols resolved; skipping")
+        logger.info("[!] No allocator symbols resolved; skipping")
         return []
 
-    print("[*] allocator entry addresses:", [hex(a) for a in sorted(alloc_addrs)])
+    logger.info("[*] allocator entry addresses: " + ", ".join(hex(a) for a in sorted(alloc_addrs)))
 
     def resolve_call_target(insn):
         if not insn.operands:
@@ -111,9 +112,9 @@ def analyze_library(lib_path: str):
                     if target is not None and target in alloc_addrs:
                         call_sites.add((insn.address, insn.size))
 
-    print(f"[*] Found {len(call_sites)} malloc-call sites")
+    logger.info(f"[*] Found {len(call_sites)} malloc-call sites")
     for cs in sorted(call_sites):
-        print("    call @", hex(cs[0]))
+        logger.info("    call @ " + hex(cs[0]))
 
     vuln_reports = []
     vuln_seen = set()
@@ -137,9 +138,6 @@ def analyze_library(lib_path: str):
         if not (addr_ast.variables & sp.variables):
             return
 
-        if not state.solver.satisfiable(extra_constraints=[sp == 0]):
-            return
-
         callsite = state.globals.get("callsite")
         key = (callsite, access_type, state.addr)
         if key in vuln_seen:
@@ -159,8 +157,7 @@ def analyze_library(lib_path: str):
     for callsite in call_sites:
         ret_addr = callsite[0] + callsite[1]
 
-        print("\n----------")
-        print(f"[*] Analyzing malloc return @ {hex(ret_addr)}")
+        logger.info(f"[*] Analyzing malloc return @ {hex(ret_addr)}")
 
         state = proj.factory.blank_state(addr=ret_addr)
         sym_ptr = claripy.BVS(f"malloc_ret_{hex(callsite[0])}", proj.arch.bits)
@@ -168,6 +165,9 @@ def analyze_library(lib_path: str):
 
         state.globals["malloc_ret"] = sym_ptr
         state.globals["callsite"] = callsite[0]
+        
+        # NUll ret
+        state.add_constraints(sym_ptr == 0x0)
 
         # assign suitable value, in case of overflow in rsp and rbp
         state.regs.rsp = 0x700000
@@ -182,17 +182,11 @@ def analyze_library(lib_path: str):
 
         simgr = proj.factory.simulation_manager(state)
 
-        def move_func(st: angr.SimState):
-            sp = st.globals.get("malloc_ret")
-            return not st.solver.satisfiable(extra_constraints=[sp == 0])
-
-        max_step = 20
+        max_step = 25
         
         while simgr.active and max_step > 0:
             simgr.step(num_inst=1)
             max_step -= 1
-            # remove checked malloc
-            simgr.move("active", "deadended", filter_func=move_func)
             # if encounter ret inst
             if simgr.unconstrained:
                 break
@@ -216,6 +210,7 @@ def main():
     args = parser.parse_args()
 
     target = args.path
+    
     try:
         libraries = collect_libraries(target)
     except FileNotFoundError as exc:
