@@ -185,7 +185,11 @@ def analyze_library(lib_path: str):
         max_step = 25
         
         while simgr.active and max_step > 0:
-            simgr.step(num_inst=1)
+            try:
+                simgr.step(num_inst=1)
+            except Exception:
+                # Due to unknown system, some funcs are not simulated, just skip
+                break
             max_step -= 1
             # if encounter ret inst
             if simgr.unconstrained:
