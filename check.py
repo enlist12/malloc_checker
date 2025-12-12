@@ -8,6 +8,7 @@ import logging
 from colorama import Fore, Style, init
 import tqdm
 import os
+import struct
     
 angr.loggers.disable_root_logger()
 
@@ -53,6 +54,9 @@ def analyze_library(lib_path: str):
 
     cfg = proj.analyses.CFGFast()
     main_obj = proj.loader.main_object
+    
+    def rebase_addr(addr):
+        return addr - main_obj.mapped_base
 
     def get_return_register_offset():
         arch = proj.arch
@@ -90,7 +94,7 @@ def analyze_library(lib_path: str):
         logger.info("[!] No allocator symbols resolved; skipping")
         return []
 
-    logger.info("[*] allocator entry addresses: " + ", ".join(hex(a) for a in sorted(alloc_addrs)))
+    logger.info("[*] allocator entry addresses: " + ", ".join(hex(a) for a in sorted([rebase_addr(addr) for addr in alloc_addrs])))
 
     def resolve_call_target(insn):
         if not insn.operands:
@@ -114,7 +118,7 @@ def analyze_library(lib_path: str):
 
     logger.info(f"[*] Found {len(call_sites)} malloc-call sites")
     for cs in sorted(call_sites):
-        logger.info("    call @ " + hex(cs[0]))
+        logger.info("    call @ " + hex(rebase_addr(cs[0])))
 
     vuln_reports = []
     vuln_seen = set()
@@ -149,7 +153,7 @@ def analyze_library(lib_path: str):
                 "library": lib_path,
                 "callsite": callsite,
                 "access_type": access_type,
-                "pc": state.addr,
+                "pc": rebase_addr(state.addr),
                 "history_len": len(state.history.bbl_addrs),
             }
         )
@@ -157,7 +161,7 @@ def analyze_library(lib_path: str):
     for callsite in call_sites:
         ret_addr = callsite[0] + callsite[1]
 
-        logger.info(f"[*] Analyzing malloc return @ {hex(ret_addr)}")
+        logger.info(f"[*] Analyzing malloc return @ {hex(rebase_addr(ret_addr))}")
 
         state = proj.factory.blank_state(addr=ret_addr)
         sym_ptr = claripy.BVS(f"malloc_ret_{hex(callsite[0])}", proj.arch.bits)
@@ -198,32 +202,128 @@ def analyze_library(lib_path: str):
     return vuln_reports
 
 
-def collect_libraries(target: str):
+def is_elf_file(filepath: str) -> bool:
+    """
+    Check if a file is an ELF executable or shared library.
+    
+    Methods:
+    1. Check ELF magic number (0x7F 'E' 'L' 'F')
+    2. Check if it's ET_EXEC (executable) or ET_DYN (shared object)
+    """
+    try:
+        with open(filepath, 'rb') as f:
+            # Read ELF header magic number
+            magic = f.read(4)
+            if magic != b'\x7fELF':
+                return False
+            
+            # Read EI_CLASS (32-bit or 64-bit)
+            ei_class = f.read(1)[0]
+            if ei_class not in (1, 2):  # ELFCLASS32=1, ELFCLASS64=2
+                return False
+            
+            # Read EI_DATA (endianness)
+            ei_data = f.read(1)[0]
+            if ei_data == 1:  # ELFDATA2LSB (little-endian)
+                endian = '<'
+            elif ei_data == 2:  # ELFDATA2MSB (big-endian)
+                endian = '>'
+            else:
+                return False
+            
+            # Skip to e_type field (offset 0x10)
+            f.seek(0x10)
+            e_type = struct.unpack(f'{endian}H', f.read(2))[0]
+            
+            # ET_EXEC=2 (executable), ET_DYN=3 (shared object)
+            # Accept both executables and shared libraries
+            return e_type in (2, 3)
+            
+    except Exception:
+        return False
+
+
+def is_executable_file(filepath: str) -> bool:
+    """
+    Check if a file is executable using multiple methods.
+    
+    1. Check execute permission bit
+    2. Check ELF format
+    """
+    # Method 1: Check permission bits (Unix/Linux)
+    if not os.access(filepath, os.X_OK):
+        # Not executable by permission, but might still be an ELF binary
+        pass
+    
+    # Method 2: Check ELF format (most reliable for binaries)
+    return is_elf_file(filepath)
+
+
+def collect_libraries(target: str, pattern: str = None):
+    """
+    Collect ELF binaries from target path.
+    
+    Args:
+        target: File path or directory
+        pattern: File pattern (e.g., "*.so", None for all ELF files)
+    
+    Returns:
+        List of paths to ELF binaries
+    """
     if os.path.isfile(target):
         return [target]
+    
     if os.path.isdir(target):
-        libs = sorted(os.path.join(target, p) for p in os.listdir(target) if os.path.isfile(os.path.join(target, p)) and p.endswith(".so"))
-        return libs
+        all_files = []
+        for filename in os.listdir(target):
+            filepath = os.path.join(target, filename)
+            if not os.path.isfile(filepath):
+                continue
+            
+            # Apply pattern filter if specified
+            if pattern:
+                if pattern == "*.so":
+                    if not filename.endswith(".so"):
+                        continue
+                elif pattern == "*.exe":
+                    if not (filename.endswith(".exe") or not '.' in filename):
+                        continue
+                # Add more patterns as needed
+            
+            # Check if it's an ELF file
+            #if is_elf_file(filepath):
+            all_files.append(filepath)
+        
+        return sorted(all_files)
+    
     raise FileNotFoundError(f"Target path '{target}' not found")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Detect unchecked malloc dereferences across libraries")
-    parser.add_argument("path", nargs="?", default=DEFAULT_LIB, help="Library file or directory containing libraries")
+    parser = argparse.ArgumentParser(description="Detect unchecked malloc dereferences across libraries and executables")
+    parser.add_argument("path", nargs="?", default=DEFAULT_LIB, help="Binary file or directory containing binaries")
     parser.add_argument("--output", default=None, help="Write aggregated findings to this file")
+    parser.add_argument("--pattern", default=None, help="File pattern filter (e.g., '*.so' for libs only)")
+    parser.add_argument("--show-all", action="store_true", help="Show all ELF files found before analysis")
     args = parser.parse_args()
 
     target = args.path
     
     try:
-        libraries = collect_libraries(target)
+        libraries = collect_libraries(target, pattern=args.pattern)
     except FileNotFoundError as exc:
         logger.error(exc)
         return
 
     if not libraries:
-        logger.warning(f"No libraries under {target}")
+        logger.warning(f"No ELF binaries found under {target}")
         return
+    
+    if args.show_all:
+        logger.info(f"Found {len(libraries)} ELF binaries:")
+        for lib in libraries:
+            logger.info(f"  - {lib}")
+        print()
 
     aggregated_reports = []
     
