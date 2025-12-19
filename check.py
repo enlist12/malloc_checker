@@ -38,16 +38,23 @@ def get_logger(name: str, level=logging.INFO):
     return logger
 
 DEFAULT_LIB = "./qnx800/target/qnx/x86_64/usr/lib/libiperf.so"
-ALLOC_FUNCS = ["malloc", "calloc", "realloc"]
+ALLOC_FUNCS = ["malloc", "calloc", "realloc", "object_alloc", "_scalloc", "_smalloc", "vm_kmem_alloc", "_srealloc", "pathmgr_node_alloc", "nto_context_alloc", "ksmalloc", "vm_pmem_alloc"]
 
 logger = get_logger("malloc_checker")
 
 def analyze_library(lib_path: str):
 
     logger.info(f"===== Analyzing {lib_path} =====")
+    
+    load_options={
+        "auto_load_libs": False,
+        "main_opts":{
+            "base_addr":0x0,
+        }
+    }
 
     try:
-        proj = angr.Project(lib_path, auto_load_libs=False)
+        proj = angr.Project(lib_path, load_options=load_options)
     except Exception as exc:
         logger.error(f"[!] Failed to load {lib_path}: {exc}")
         return []
@@ -69,6 +76,13 @@ def analyze_library(lib_path: str):
         else:
             raise Exception(f"Unsupported arch: {arch.name}")
         return arch.registers[reg_name][0]
+    
+    def debug(addr,ir=False):
+        block = proj.factory.block(addr)
+        if ir:
+            block.vex.pp()
+        else:
+            block.pp()
 
     alloc_addrs = set()
     for name in ALLOC_FUNCS:
